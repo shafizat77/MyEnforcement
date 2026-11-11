@@ -116,6 +116,8 @@ dd{margin:0;font-weight:600;text-align:right;overflow-wrap:anywhere;font-variant
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .mini{display:flex;gap:8px;margin:-4px 0 12px}
 .mini button{flex:1;border:1.5px solid var(--line);background:transparent;border-radius:10px;padding:9px;font-size:13px;font-weight:700}
+.implist{margin:0 0 12px;padding-left:18px;font-size:14px;color:var(--bad)}
+.note{font-size:14px;color:var(--muted);margin:0 0 12px}
 .err{color:var(--bad);font-size:14px;font-weight:600;margin:0 0 10px;min-height:0}
 
 /* Menu */
@@ -147,12 +149,13 @@ dd{margin:0;font-weight:600;text-align:right;overflow-wrap:anywhere;font-variant
 </div>
 
 <div class="menu" id="menu">
-  <button id="mExport">Eksport data (fail JSON)</button>
-  <button id="mImport">Import data (fail JSON)</button>
+  <button id="mImport">Import dari Excel / CSV</button>
+  <button id="mXlOut">Eksport ke Excel</button>
+  <button id="mExport">Sandaran data (fail JSON)</button>
   <button id="mReset">Set semula ke data contoh</button>
   <small id="mInfo"></small>
 </div>
-<input type="file" id="file" accept="application/json,.json" hidden>
+<input type="file" id="file" accept=".xlsx,.xls,.csv,.json,application/json,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" hidden>
 
 <div class="fabs">
   <button class="fab" id="locate" aria-label="Lokasi saya"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg></button>
@@ -163,9 +166,11 @@ dd{margin:0;font-weight:600;text-align:right;overflow-wrap:anywhere;font-variant
 <section class="sheet" id="sheet" aria-live="polite"></section>
 <div class="scrim" id="scrim"></div>
 <form class="form" id="form" novalidate></form>
+<section class="form" id="imp" aria-live="polite"></section>
 <div class="toast" id="toast" role="status"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script>
 (function(){
 'use strict';
@@ -396,7 +401,7 @@ function openForm(c){
   };
   setTimeout(function(){if(isNew)$('fNama').focus()},260);
 }
-function closeForm(){form.classList.remove('open');scrim.classList.remove('open')}
+function closeForm(){form.classList.remove('open');$('imp').classList.remove('open');scrim.classList.remove('open')}
 scrim.onclick=closeForm;
 $('add').onclick=function(){closeSheet();openForm(null)};
 
@@ -431,22 +436,183 @@ $('mExport').onclick=function(){
   toast('Fail sandaran dimuat turun');
 };
 $('mImport').onclick=function(){menu.classList.remove('open');$('file').click()};
-$('file').onchange=function(){
-  var f=this.files[0];if(!f)return;
-  var r=new FileReader();
-  r.onload=function(){
-    try{
-      var a=JSON.parse(r.result);
-      if(!Array.isArray(a))throw 0;
-      var ok=a.filter(function(c){return c&&c.nama&&typeof c.lat==='number'&&typeof c.lng==='number'}).map(function(c){
-        return {id:c.id||uid(),nama:String(c.nama),lot:String(c.lot||''),mukim:String(c.mukim||''),pengendali:String(c.pengendali||''),
-          adaKM:!!c.adaKM,noKM:String(c.noKM||''),tamat:String(c.tamat||''),catatan:String(c.catatan||''),lat:c.lat,lng:c.lng};
-      });
-      if(!ok.length)throw 0;
-      cases=ok;save();closeSheet();drawMarkers();toast(ok.length+' kes diimport');
-    }catch(e){toast('Fail tidak sah. Gunakan fail eksport MyEnforcement.')}
+
+/*IMPORT-PARSE-START*/
+var HEAD=['Nama Tapak','No Lot','Mukim','Pengendali','Ada KM','No KM','Tarikh Tamat KM','Koordinat','Catatan'];
+var ALIAS={
+  nama:['nama','namatapak','namasite','namamenara','menara','site','tapak','namasitetapak'],
+  lot:['lot','nolot','nomborlot','lotno'],
+  mukim:['mukim','kawasan','daerahmukim'],
+  pengendali:['pengendali','operator','syarikat','telco','pemilik'],
+  ada:['adakm','km','kebenaranmerancang','statuskm','adakebenaranmerancang'],
+  nokm:['nokm','nomborkm','nokebenaranmerancang','rujukankm'],
+  tamat:['tarikhtamatkm','tarikhtamat','tamat','tarikhexpired','expired','expiry','tamatkm','tarikhluput'],
+  lat:['latitud','latitude','lat'],
+  lng:['longitud','longitude','lng','long','lon'],
+  koord:['koordinat','koordinatgps','coordinates','gps','pautangooglemaps','googlemaps'],
+  catatan:['catatan','nota','remark','remarks','ulasan']
+};
+function sq(s){return String(s==null?'':s).toLowerCase().replace(/[^a-z0-9]/g,'')}
+function mapHeaders(keys){
+  var m={};
+  keys.forEach(function(k){
+    var s=sq(k);
+    Object.keys(ALIAS).forEach(function(f){if(!m[f]&&ALIAS[f].indexOf(s)>-1)m[f]=k});
+  });
+  return m;
+}
+function realDate(y,mo,d){
+  var dt=new Date(y,mo-1,d);
+  return dt.getFullYear()===y&&dt.getMonth()===mo-1&&dt.getDate()===d?y+'-'+pad(mo)+'-'+pad(d):null;
+}
+function toDate(v){
+  if(v===''||v==null)return null;
+  if(v instanceof Date&&!isNaN(v))return realDate(v.getFullYear(),v.getMonth()+1,v.getDate());
+  if(typeof v==='number'){
+    if(v>20000&&v<90000&&window.XLSX){var p=XLSX.SSF.parse_date_code(v);return p?realDate(p.y,p.m,p.d):null}
+    return null;
+  }
+  var s=String(v).trim(),m;
+  if((m=s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/)))return realDate(+m[3],+m[2],+m[1]);
+  if((m=s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/)))return realDate(+m[1],+m[2],+m[3]);
+  return null;
+}
+function toAda(v){
+  var s=sq(v);
+  if(!s)return null;
+  if(['ya','y','ada','yes','1','true','benar'].indexOf(s)>-1)return true;
+  if(['tidak','tiada','no','n','0','false','x','takada'].indexOf(s)>-1)return false;
+  return null;
+}
+function num(v){
+  if(typeof v==='number')return v;
+  var n=parseFloat(String(v).replace(',','.'));
+  return isNaN(n)?null:n;
+}
+function toCoord(row,m){
+  var lat=null,lng=null;
+  if(m.lat&&m.lng){lat=num(row[m.lat]);lng=num(row[m.lng])}
+  if((lat===null||lng===null)&&m.koord){
+    var s=String(row[m.koord]||''),r;
+    r=s.match(/(-?\d+\.\d+)\s*[,;]\s*(-?\d+\.\d+)/)||s.match(/(-?\d+\.\d+)\s+(-?\d+\.\d+)/);
+    if(r){lat=parseFloat(r[1]);lng=parseFloat(r[2])}
+  }
+  if(lat===null||lng===null)return null;
+  if(lat>50&&lng<50){var t=lat;lat=lng;lng=t}
+  return [lat,lng];
+}
+function parseRows(rows){
+  var keys=Object.keys(rows[0]||{});
+  var m=mapHeaders(keys);
+  var missing=[];
+  if(!m.nama)missing.push('Nama Tapak');
+  if(!m.lot)missing.push('No Lot');
+  if(!m.koord&&!(m.lat&&m.lng))missing.push('Koordinat');
+  if(missing.length)return {missing:missing,ok:[],errs:[]};
+  var ok=[],errs=[];
+  rows.forEach(function(row,i){
+    var rn=i+2;
+    var blank=keys.every(function(k){return String(row[k]).trim()===''});
+    if(blank)return;
+    var nama=String(row[m.nama]).trim(),lot=String(row[m.lot]).trim();
+    if(!nama){errs.push('Baris '+rn+': nama tapak kosong');return}
+    if(!lot){errs.push('Baris '+rn+' ('+nama+'): no. lot kosong');return}
+    var c=toCoord(row,m);
+    if(!c){errs.push('Baris '+rn+' ('+nama+'): koordinat tidak dapat dibaca');return}
+    if(!BOUNDS.contains(c)){errs.push('Baris '+rn+' ('+nama+'): koordinat di luar Manjung');return}
+    var tamat=m.tamat?toDate(row[m.tamat]):null;
+    var rawTamat=m.tamat?String(row[m.tamat]).trim():'';
+    var ada=m.ada?toAda(row[m.ada]):null;
+    if(ada===null)ada=!!tamat;
+    if(ada&&!tamat){errs.push('Baris '+rn+' ('+nama+'): tarikh tamat KM '+(rawTamat?'"'+rawTamat+'" tidak sah (guna dd/mm/yyyy)':'kosong'));return}
+    ok.push({id:uid(),nama:nama,lot:lot,mukim:m.mukim?String(row[m.mukim]).trim():'',pengendali:m.pengendali?String(row[m.pengendali]).trim():'',
+      adaKM:ada,noKM:ada&&m.nokm?String(row[m.nokm]).trim():'',tamat:ada?tamat:'',catatan:m.catatan?String(row[m.catatan]).trim():'',lat:c[0],lng:c[1]});
+  });
+  return {missing:[],ok:ok,errs:errs};
+}
+/*IMPORT-PARSE-END*/
+
+function readSheet(wb,fname){
+  var ws=wb.Sheets[wb.SheetNames[0]];
+  var rows=ws?XLSX.utils.sheet_to_json(ws,{defval:'',raw:true}):[];
+  if(!rows.length){toast('Fail kosong atau tiada baris data');return}
+  showImport(parseRows(rows),fname);
+}
+var imp=$('imp');
+function showImport(res,fname){
+  if(res.missing.length){
+    imp.innerHTML='<div class="grab"></div><h2>Lajur tidak dijumpai</h2><p class="sub">'+esc(fname)+'</p>'+
+      '<p class="err">Tiada lajur: '+esc(res.missing.join(', '))+'.</p><p class="note">Gunakan templat Excel MyEnforcement, atau buat eksport Excel dari menu dan kemas kini fail itu.</p>'+
+      '<div class="actions"><button class="btn" id="iNo">Tutup</button></div>';
+    open();$('iNo').onclick=closeForm;return;
+  }
+  var hasSample=cases.some(function(c){return c.contoh});
+  imp.innerHTML='<div class="grab"></div><h2>Import dari fail</h2><p class="sub">'+esc(fname)+'</p>'+
+   '<dl><dt>Baris sah</dt><dd>'+res.ok.length+'</dd><dt>Baris bermasalah</dt><dd>'+res.errs.length+'</dd></dl>'+
+   (res.errs.length?'<ul class="implist">'+res.errs.slice(0,6).map(function(e){return '<li>'+esc(e)+'</li>'}).join('')+(res.errs.length>6?'<li>dan '+(res.errs.length-6)+' lagi</li>':'')+'</ul>':'')+
+   '<p class="note"><b>Tambah &amp; kemas kini</b>: lot yang sama dikemas kini, lot baharu ditambah, kes lain dikekalkan.'+(hasSample?' Data contoh akan dibuang.':'')+
+   ' <b>Gantikan semua</b>: semua kes sedia ada diganti dengan isi fail.</p>'+
+   '<div class="actions"><button class="btn" id="iNo">Batal</button>'+
+   (res.ok.length?'<button class="btn main" id="iMerge">Tambah &amp; kemas kini</button><button class="btn danger" id="iRep">Gantikan semua</button>':'')+'</div>';
+  open();
+  $('iNo').onclick=closeForm;
+  if(!res.ok.length)return;
+  $('iMerge').onclick=function(){
+    var keep=cases.filter(function(c){return !c.contoh}),add=0,upd=0;
+    res.ok.forEach(function(r){
+      var k=sq(r.lot),i=keep.findIndex(function(c){return sq(c.lot)===k});
+      if(i>-1){r.id=keep[i].id;keep[i]=r;upd++}else{keep.push(r);add++}
+    });
+    cases=keep;done(add+' ditambah, '+upd+' dikemas kini');
   };
-  r.readAsText(f);this.value='';
+  var armedRep=false;
+  $('iRep').onclick=function(){
+    if(!armedRep){armedRep=true;this.textContent='Sahkan gantikan semua';this.classList.add('arm');return}
+    cases=res.ok;done(res.ok.length+' kes diimport');
+  };
+  function open(){imp.classList.add('open');scrim.classList.add('open')}
+  function done(msg){
+    save();closeForm();closeSheet();drawMarkers();
+    if(cases.length){var b=L.latLngBounds(cases.map(function(c){return [c.lat,c.lng]}));map.fitBounds(b.pad(.2),{maxZoom:14})}
+    toast(msg);
+  }
+}
+$('file').onchange=function(){
+  var f=this.files[0];this.value='';if(!f)return;
+  var ext=(f.name.split('.').pop()||'').toLowerCase(),r=new FileReader();
+  r.onerror=function(){toast('Fail tidak dapat dibaca')};
+  if(ext==='json'){
+    r.onload=function(){
+      try{
+        var a=JSON.parse(r.result);if(!Array.isArray(a))throw 0;
+        var ok=a.filter(function(c){return c&&c.nama&&typeof c.lat==='number'&&typeof c.lng==='number'}).map(function(c){
+          return {id:c.id||uid(),nama:String(c.nama),lot:String(c.lot||''),mukim:String(c.mukim||''),pengendali:String(c.pengendali||''),
+            adaKM:!!c.adaKM,noKM:String(c.noKM||''),tamat:String(c.tamat||''),catatan:String(c.catatan||''),lat:c.lat,lng:c.lng};
+        });
+        if(!ok.length)throw 0;
+        showImport({missing:[],ok:ok,errs:[]},f.name);
+      }catch(e){toast('Fail JSON tidak sah')}
+    };
+    r.readAsText(f);return;
+  }
+  if(!window.XLSX){toast('Pustaka Excel belum dimuat. Sambung internet dan cuba lagi.');return}
+  if(ext==='csv'){
+    r.onload=function(){try{readSheet(XLSX.read(r.result,{type:'string',raw:true}),f.name)}catch(e){toast('Fail CSV tidak dapat dibaca')}};
+    r.readAsText(f);
+  }else{
+    r.onload=function(){try{readSheet(XLSX.read(r.result,{type:'array'}),f.name)}catch(e){toast('Fail Excel tidak dapat dibaca')}};
+    r.readAsArrayBuffer(f);
+  }
+};
+$('mXlOut').onclick=function(){
+  menu.classList.remove('open');
+  if(!window.XLSX){toast('Pustaka Excel belum dimuat. Sambung internet dan cuba lagi.');return}
+  var rows=cases.map(function(c){return [c.nama,c.lot,c.mukim,c.pengendali,c.adaKM?'Ya':'Tidak',c.noKM,c.adaKM?fmt(c.tamat):'',c.lat.toFixed(5)+', '+c.lng.toFixed(5),c.catatan]});
+  var ws=XLSX.utils.aoa_to_sheet([HEAD].concat(rows));
+  ws['!cols']=[{wch:32},{wch:14},{wch:22},{wch:16},{wch:9},{wch:20},{wch:16},{wch:22},{wch:30}];
+  var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Kes');
+  XLSX.writeFile(wb,'myenforcement-'+ymd(new Date())+'.xlsx');
+  toast('Fail Excel dimuat turun');
 };
 var resetArmed=false;
 $('mReset').onclick=function(){
